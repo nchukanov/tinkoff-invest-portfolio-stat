@@ -199,7 +199,7 @@ async function falls(positionsParams) {
 
 // noinspection JSUnusedGlobalSymbols
 async function consolidate(compositions, positionsParams) {
-    const getConfiguredCompositionWith = ticker => R.find(R.pipe(R.prop('tickers'), R.contains(ticker)))(compositions),
+    const getConfiguredCompositionWith = ticker => R.find(R.pipe(R.prop('tickers'), R.includes(ticker)))(compositions),
 
         consolidatingReducer = (acc, it) => {
             const configuredComposition = getConfiguredCompositionWith(it.ticker);

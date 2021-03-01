@@ -20,12 +20,12 @@ import * as stat from './statistics.js';
 
         console.dir(await stat.purchasesByInstrument(periods.Mar[0], periods.Mar[1]), {depth: 1})
 
-        // console.log(await stat.currencySells(periods.Feb[0], periods.Feb[1]));
-        // console.log(await stat.currencySells(periods.Mar[0], periods.Mar[1]));
+        console.log(await stat.currencySells(periods.Feb[0], periods.Feb[1]));
+        console.log(await stat.currencySells(periods.Mar[0], periods.Mar[1]));
 
-        // console.log((await stat.falls()).map(stat.prettifyValues))
+        console.log((await stat.falls()).map(stat.prettifyMoneyValues))
 
-        // console.log((await stat.consolidate(compositions, {inCurrency: 'RUB'})).map(stat.prettifyValues));
+        console.log((await stat.consolidate(compositions, {inCurrency: 'RUB'})).map(stat.prettifyMoneyValues));
 
     } catch (err) {
         console.error(err);
