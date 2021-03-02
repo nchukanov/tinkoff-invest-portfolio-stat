@@ -4,14 +4,20 @@ import OpenAPI from '@tinkoff/invest-openapi-js-sdk';
 import {exchangeRates} from 'exchange-rates-api';
 
 dotenv.config();
+
 const api = new OpenAPI({
     apiURL: 'https://api-invest.tinkoff.ru/openapi',
     secretToken: process.env.TOKEN,
     socketURL: 'wss://api-invest.tinkoff.ru/openapi/md/v1/md-openapi/ws'
 });
 
-const usdRates = {},
+const accounts = (await api.accounts()).accounts,
+    usdRates = {},
     average = R.converge(R.divide, [R.sum, R.length]);
+
+function setPrimaryAccount() {
+    api.setCurrentAccountId(accounts[0].brokerAccountId);
+}
 
 async function preloadRate(from, to) {
     if (!usdRates[from]) {
@@ -60,13 +66,41 @@ function prettifyMoneyValues(position) {
 
 function mapValues(obj, mapper) {
     return Object.fromEntries(
-        Object.entries(obj).map(([key, value]) => [key,  mapper(value)])
+        Object.entries(obj).map(([key, value]) => [key, mapper(value)])
     );
 }
 
+async function forEachAccount(op) {
+    const result = await Promise.all(accounts.reduce((acc, it) => {
+        api.setCurrentAccountId(it.brokerAccountId);
+        return acc.concat(op());
+    }, []));
+    setPrimaryAccount();
+
+    return result.flatMap(R.identity);
+}
+
+async function _getPortfolioPositions() {
+    const getPositions = () => api.portfolio().then(R.prop('positions'));
+    return forEachAccount(getPositions);
+}
+
+//todo: merge same purchases into one by adding up all number fields
 async function purchases(from, to) {
-    return (await api.operations({from: from.toISOString(), to: to.toISOString()})).operations
-        .filter(it => it.operationType === 'Buy' && it.status === 'Done');
+    const positions = await _getPortfolioPositions(),
+        getPositionByFigi = figi => R.find(R.propEq('figi', figi))(positions),
+        getOperations = () => api.operations({from: from.toISOString(), to: to.toISOString()}).then(R.prop('operations'));
+
+    return (await forEachAccount(getOperations))
+        .filter(it => it.operationType === 'Buy' && it.status === 'Done')
+        .map(it => {
+            const position = getPositionByFigi(it.figi);
+            return {
+                ticker: position?.ticker,
+                name: position?.name,
+                ...it
+            }
+        });
 }
 
 // noinspection JSUnusedGlobalSymbols
@@ -76,7 +110,7 @@ async function currencySells(from, to) {
 
         quantity = R.sum(operations.map(R.prop('quantity'))),
         payment = R.sum(operations.map(R.prop('payment'))),
-        commission = getTotalCommission(operations),
+        commission = calculateTotalCommission(operations),
         averagePrice = average(operations.map(R.prop('price')));
 
     return {
@@ -87,8 +121,8 @@ async function currencySells(from, to) {
     }
 }
 
-function getTotalCommission(operations, currency) {
-    let result = R.sum(operations.map(R.pipe(R.path(['commission', 'value']), R.defaultTo(0))));
+function calculateTotalCommission(objectsWithCommission, currency) {
+    let result = R.sum(objectsWithCommission.map(R.pipe(R.path(['commission', 'value']), R.defaultTo(0))));
     if (currency === 'USD') {
         result *= getRate('USD');
     }
@@ -105,7 +139,7 @@ async function purchasesByInstrument(from, to) {
         calculateTotals = operations => {
             const currency = operations[0].currency,
                 payment = -R.sum(operations.map(R.prop('payment'))),
-                commission = getTotalCommission(operations, currency);
+                commission = calculateTotalCommission(operations, currency);
 
             return {
                 currency,
@@ -162,7 +196,7 @@ async function positions({inCurrency} = {}) {
     if (inCurrency === 'RUB') {
         await preloadRate('USD', 'RUB');
     }
-    return (await api.portfolio()).positions
+    return (await _getPortfolioPositions())
         .map(it => {
             const totalPrice = it.averagePositionPrice.value * it.balance,
                 expectedYieldPercent = it.expectedYield.value * 100 / totalPrice;
