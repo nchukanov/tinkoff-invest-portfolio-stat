@@ -13,7 +13,37 @@ const api = new OpenAPI({
 
 const accounts = (await api.accounts()).accounts,
     usdRates = {},
-    average = R.converge(R.divide, [R.sum, R.length]);
+    average = R.converge(R.divide, [R.sum, R.length]),
+
+    mergeMoneyObjects = R.mergeWith((a, b) => typeof a == 'number' ? a + b : a),
+    mergePositions = (a, b) => {
+        const result = R.mergeWith((prop1, prop2) => {
+            if (isMoneyObject(prop1)) {
+                return mergeMoneyObjects(prop1, prop2);
+            } else if (typeof prop1 == 'number') {
+                return prop1 + prop2;
+            } else {
+                return prop1;
+            }
+        })(a, b);
+
+        result.averagePositionPrice.value /= 2;
+        result.expectedYield.percent = result.expectedYield.value * 100 / result.totalPrice.value;
+
+        return result;
+    },
+
+    portfolioPositions = await _getPortfolioPositions(),
+    getPositionByFigi = figi => R.find(R.propEq('figi', figi))(portfolioPositions),
+    addTickerAndName = operation => {
+        const {ticker, name} = getPositionByFigi(operation.figi);
+        return {
+            ticker,
+            name,
+            ...operation
+        }
+    };
+
 
 function setPrimaryAccount() {
     api.setCurrentAccountId(accounts[0].brokerAccountId);
@@ -56,7 +86,7 @@ function isMoneyObject(obj) {
 }
 
 function prettifyMoneyValues(position) {
-    const result = mapValues(position, value => isMoneyObject(value) ? formatMoneyObject(value) : value);
+    const result = mapValuesIn(position, formatMoneyObject, isMoneyObject);
     if (position.price) {
         result.price = formatMoney(position.price, position.currency);
         result.payment = formatMoney(position.payment, position.currency);
@@ -64,9 +94,10 @@ function prettifyMoneyValues(position) {
     return result;
 }
 
-function mapValues(obj, mapper) {
+function mapValuesIn(obj, mapper, predicate = R.T) {
     return Object.fromEntries(
-        Object.entries(obj).map(([key, value]) => [key, mapper(value)])
+        Object.entries(obj)
+            .map(([key, value]) => [key, predicate(value) ? mapper(value) : value])
     );
 }
 
@@ -85,22 +116,15 @@ async function _getPortfolioPositions() {
     return forEachAccount(getPositions);
 }
 
-//todo: merge same purchases into one by adding up all number fields
 async function purchases(from, to) {
-    const positions = await _getPortfolioPositions(),
-        getPositionByFigi = figi => R.find(R.propEq('figi', figi))(positions),
-        getOperations = () => api.operations({from: from.toISOString(), to: to.toISOString()}).then(R.prop('operations'));
+    const getOperations = () => api.operations({
+        from: from.toISOString(),
+        to: to.toISOString()
+    }).then(R.prop('operations'));
 
     return (await forEachAccount(getOperations))
         .filter(it => it.operationType === 'Buy' && it.status === 'Done')
-        .map(it => {
-            const position = getPositionByFigi(it.figi);
-            return {
-                ticker: position?.ticker,
-                name: position?.name,
-                ...it
-            }
-        });
+        .map(addTickerAndName)
 }
 
 // noinspection JSUnusedGlobalSymbols
@@ -119,6 +143,17 @@ async function currencySells(from, to) {
         commission: formatMoney(commission, 'RUB'),
         averagePrice: formatMoney(averagePrice, 'RUB')
     }
+}
+
+async function dividends(year) {
+    const getOperations = () => api.operations({
+        from: new Date(year, 0, 1).toISOString(),
+        to: new Date(year, 11, 31).toISOString()
+    }).then(R.prop('operations'));
+
+    return (await forEachAccount(getOperations))
+        .filter(it => it.operationType === 'Dividend')
+        .map(addTickerAndName)
 }
 
 function calculateTotalCommission(objectsWithCommission, currency) {
@@ -150,7 +185,7 @@ async function purchasesByInstrument(from, to) {
         },
 
         withTotals = groups => {
-            const result = mapValues(groups, operations => ({
+            const result = mapValuesIn(groups, operations => ({
                 ...calculateTotals(operations),
                 operations: operations
             }));
@@ -161,7 +196,7 @@ async function purchasesByInstrument(from, to) {
         },
 
         prettifyValues = groups => {
-            return mapValues(groups, value => {
+            return mapValuesIn(groups, value => {
                 if (typeof value === 'object') {
                     return {
                         ...value,
@@ -196,24 +231,31 @@ async function positions({inCurrency} = {}) {
     if (inCurrency === 'RUB') {
         await preloadRate('USD', 'RUB');
     }
-    return (await _getPortfolioPositions())
-        .map(it => {
-            const totalPrice = it.averagePositionPrice.value * it.balance,
-                expectedYieldPercent = it.expectedYield.value * 100 / totalPrice;
 
-            return {
-                ...it,
-                averagePositionPrice: convertToCurrency(inCurrency, it.averagePositionPrice),
-                totalPrice: convertToCurrency(inCurrency, {
-                    currency: it.averagePositionPrice.currency,
-                    value: totalPrice
-                }),
-                expectedYield: {
-                    ...convertToCurrency(inCurrency, it.expectedYield),
-                    percent: expectedYieldPercent
+    const positions = (await _getPortfolioPositions())
+            .map(it => {
+                const totalPrice = it.averagePositionPrice.value * it.balance,
+                    expectedYieldPercent = it.expectedYield.value * 100 / totalPrice;
+
+                return {
+                    ...it,
+                    averagePositionPrice: convertToCurrency(inCurrency, it.averagePositionPrice),
+                    totalPrice: convertToCurrency(inCurrency, {
+                        currency: it.averagePositionPrice.currency,
+                        value: totalPrice
+                    }),
+                    expectedYield: {
+                        ...convertToCurrency(inCurrency, it.expectedYield),
+                        percent: expectedYieldPercent
+                    }
                 }
-            }
-        });
+            }),
+
+        groupByFigi = R.pipe(R.groupBy(R.prop('figi')), Object.values),
+        mergeGroups = list => list.reduce(mergePositions);
+
+    return groupByFigi(positions)
+        .map(mergeGroups);
 }
 
 // noinspection JSUnusedGlobalSymbols
@@ -277,10 +319,21 @@ async function consolidate(compositions, positionsParams) {
             };
         }
 
+    //todo: order by total price desc
     return (await positions(positionsParams))
         .filter(R.propEq('instrumentType', 'Etf'))
         .reduce(consolidatingReducer, [])
         .map(calculateConsolidatedTotals);
 }
 
-export {purchases, positions, currencySells, stocks, falls, consolidate, prettifyMoneyValues, purchasesByInstrument};
+export {
+    purchases,
+    positions,
+    currencySells,
+    stocks,
+    falls,
+    consolidate,
+    prettifyMoneyValues,
+    purchasesByInstrument,
+    dividends
+};
