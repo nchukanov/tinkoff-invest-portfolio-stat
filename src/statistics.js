@@ -14,9 +14,24 @@ const api = new OpenAPI({
 const accounts = (await api.accounts()).accounts,
     usdRates = {},
     average = R.converge(R.divide, [R.sum, R.length]),
-
-    mergeMoneyObjects = R.mergeWith((a, b) => typeof a == 'number' ? a + b : a),
-    mergePositions = (a, b) => {
+    withExpectedYieldPercent = pos => {
+        pos.expectedYield.percent = pos.expectedYield.value * 100 / pos.totalPrice.value;
+        return pos;
+    },
+    mergeMoneyObjects = (a, b) => {
+        if (!R.eqProps('currency')(a, b)) {
+            throw new Error(`Can't merge objects in different currencies. Try defining the 'inCurrency' attribute in the request`);
+        }
+        const result = {
+            ...a,
+            value: a.value + b.value
+        };
+        if (!R.eqProps('originalCurrency')(a, b)) {
+            delete result.originalCurrency;
+        }
+        return result;
+    },
+    _mergePositionsReducer = (a, b) => {
         const result = R.mergeWith((prop1, prop2) => {
             if (isMoneyObject(prop1)) {
                 return mergeMoneyObjects(prop1, prop2);
@@ -28,22 +43,23 @@ const accounts = (await api.accounts()).accounts,
         })(a, b);
 
         result.averagePositionPrice.value /= 2;
-        result.expectedYield.percent = result.expectedYield.value * 100 / result.totalPrice.value;
 
-        return result;
+        return withExpectedYieldPercent(result)
+    },
+    mergePositions = (positions) => {
+        return positions.reduce(_mergePositionsReducer);
     },
 
-    portfolioPositions = await _getPortfolioPositions(),
-    getPositionByFigi = figi => R.find(R.propEq('figi', figi))(portfolioPositions),
+    _portfolioPositions = await _getPortfolioPositions(),
+    _getPositionByFigi = figi => R.find(R.propEq('figi', figi))(_portfolioPositions),
     addTickerAndName = operation => {
-        const {ticker, name} = getPositionByFigi(operation.figi);
+        const {ticker, name} = _getPositionByFigi(operation.figi);
         return {
             ticker,
             name,
             ...operation
         }
     };
-
 
 function setPrimaryAccount() {
     api.setCurrentAccountId(accounts[0].brokerAccountId);
@@ -145,6 +161,7 @@ async function currencySells(from, to) {
     }
 }
 
+// noinspection JSUnusedGlobalSymbols
 async function dividends(year) {
     const getOperations = () => api.operations({
         from: new Date(year, 0, 1).toISOString(),
@@ -227,69 +244,57 @@ function convertToCurrency(toCurrency, moneyObj) {
     }
 }
 
-async function positions({inCurrency} = {}) {
+async function positions({inCurrency, predicate = R.T} = {}) {
     if (inCurrency === 'RUB') {
         await preloadRate('USD', 'RUB');
     }
 
     const positions = (await _getPortfolioPositions())
-            .map(it => {
-                const totalPrice = it.averagePositionPrice.value * it.balance,
-                    expectedYieldPercent = it.expectedYield.value * 100 / totalPrice;
-
-                return {
+            .filter(predicate)
+            .map(it =>
+                withExpectedYieldPercent({
                     ...it,
                     averagePositionPrice: convertToCurrency(inCurrency, it.averagePositionPrice),
                     totalPrice: convertToCurrency(inCurrency, {
                         currency: it.averagePositionPrice.currency,
-                        value: totalPrice
+                        value: it.averagePositionPrice.value * it.balance
                     }),
-                    expectedYield: {
-                        ...convertToCurrency(inCurrency, it.expectedYield),
-                        percent: expectedYieldPercent
-                    }
-                }
-            }),
+                    expectedYield: convertToCurrency(inCurrency, it.expectedYield)
+                })),
 
-        groupByFigi = R.pipe(R.groupBy(R.prop('figi')), Object.values),
-        mergeGroups = list => list.reduce(mergePositions);
+        groupByFigi = R.pipe(R.groupBy(R.prop('figi')), Object.values);
 
     return groupByFigi(positions)
-        .map(mergeGroups);
+        .map(mergePositions);
 }
 
 // noinspection JSUnusedGlobalSymbols
-async function stocks(positionsParams) {
-    return (await positions(positionsParams))
+async function stocks(positionParams) {
+    return (await positions(positionParams))
         .filter(it => it.instrumentType !== 'Currency')
         .sort((a, b) => b.totalPrice.value - a.totalPrice.value);
 }
 
 // noinspection JSUnusedGlobalSymbols
-async function falls(positionsParams) {
+async function falls(positionParams) {
     const expectedYieldPercent = R.path(['expectedYield', 'percent']);
-    return (await positions(positionsParams))
+    return (await positions(positionParams))
         .filter(it => expectedYieldPercent(it) < 0 && it.instrumentType !== 'Currency')
         .sort((a, b) => expectedYieldPercent(a) - expectedYieldPercent(b));
 }
 
 // noinspection JSUnusedGlobalSymbols
-async function consolidate(compositions, positionsParams) {
-    const getConfiguredCompositionWith = ticker => R.find(R.pipe(R.prop('tickers'), R.includes(ticker)))(compositions),
-
-        consolidatingReducer = (acc, it) => {
-            const configuredComposition = getConfiguredCompositionWith(it.ticker);
-            if (!!configuredComposition) {
-                const consolidatedPositionTicker = configuredComposition.name,
-                    consolidatedPosition = R.find(R.propEq('ticker', consolidatedPositionTicker))(acc);
+async function consolidateBy(compositionFn, positionParams) {
+    const consolidatingReducer = (acc, it) => {
+            const compositionTicker = compositionFn(it);
+            if (!!compositionTicker) {
+                const consolidatedPosition = R.find(R.propEq('ticker', compositionTicker))(acc);
                 if (!!consolidatedPosition) {
                     consolidatedPosition.positions = [...consolidatedPosition.positions, it];
                 } else {
                     acc = [...acc, {
-                        ticker: consolidatedPositionTicker,
-                        name: consolidatedPositionTicker,
+                        ticker: compositionTicker,
                         consolidated: true,
-                        instrumentType: it.instrumentType,
                         positions: [it]
                     }]
                 }
@@ -300,30 +305,31 @@ async function consolidate(compositions, positionsParams) {
             return acc;
         },
 
-        merge = (a, b) => ({...a, value: a.value + b.value}),
-
         calculateConsolidatedTotals = it => {
             if (!it.consolidated) {
                 return it;
             }
 
-            const totalPrice = it.positions.map(R.prop('totalPrice')).reduce(merge),
-                expectedYield = it.positions.map(R.prop('expectedYield')).reduce(merge);
-            return {
+            const {totalPrice, expectedYield} = mergePositions(it.positions);
+            return withExpectedYieldPercent({
                 ...it,
                 totalPrice,
-                expectedYield: {
-                    ...expectedYield,
-                    percent: expectedYield.value * 100 / totalPrice.value,
-                }
-            };
+                expectedYield
+            });
         }
 
-    //todo: order by total price desc
-    return (await positions(positionsParams))
-        .filter(R.propEq('instrumentType', 'Etf'))
+    //todo: order both positions and compositions by total price desc
+    return (await positions(positionParams))
         .reduce(consolidatingReducer, [])
         .map(calculateConsolidatedTotals);
+}
+
+// noinspection JSUnusedGlobalSymbols
+async function consolidate(compositions, positionParams) {
+    const findCompositionWithTicker = ticker => R.find(R.pipe(R.prop('tickers'), R.includes(ticker))),
+        findOutCompositionName = pos => R.pipe(findCompositionWithTicker(pos.ticker), R.prop('name'))(compositions);
+
+    return (await consolidateBy(findOutCompositionName, positionParams));
 }
 
 export {
@@ -333,7 +339,9 @@ export {
     stocks,
     falls,
     consolidate,
+    consolidateBy,
     prettifyMoneyValues,
+    formatMoney,
     purchasesByInstrument,
     dividends
 };
