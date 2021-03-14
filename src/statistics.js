@@ -15,7 +15,9 @@ const accounts = (await api.accounts()).accounts,
     usdRates = {},
     average = R.converge(R.divide, [R.sum, R.length]),
     withExpectedYieldPercent = pos => {
-        pos.expectedYield.percent = pos.expectedYield.value * 100 / pos.totalPrice.value;
+        if (pos.expectedYield && pos.totalPrice) {
+            pos.expectedYield.percent = pos.expectedYield.value * 100 / pos.totalPrice.value;
+        }
         return pos;
     },
     mergeMoneyObjects = (a, b) => {
@@ -31,8 +33,8 @@ const accounts = (await api.accounts()).accounts,
         }
         return result;
     },
-    _mergePositionsReducer = (a, b) => {
-        const result = R.mergeWith((prop1, prop2) => {
+    mergeTwoPositions = (a, b) => {
+        let result = R.mergeWith((prop1, prop2) => {
             if (isMoneyObject(prop1)) {
                 return mergeMoneyObjects(prop1, prop2);
             } else if (typeof prop1 == 'number') {
@@ -42,12 +44,23 @@ const accounts = (await api.accounts()).accounts,
             }
         })(a, b);
 
-        result.averagePositionPrice.value /= 2;
+        if (result.averagePositionPrice) {
+            result.averagePositionPrice.value /= 2;
+        }
+        if (result.price) {
+            result.price /= 2;
+        }
+        if (result.expectedYield) {
+            result = withExpectedYieldPercent(result);
+        }
 
-        return withExpectedYieldPercent(result)
+        return result;
     },
-    mergePositions = (positions) => {
-        return positions.reduce(_mergePositionsReducer);
+    mergeSamePositions = positions => {
+        const positionsByFigi = R.pipe(R.groupBy(R.prop('figi')), Object.values)(positions);
+
+        return positionsByFigi
+            .map(samePositions => samePositions.reduce(mergeTwoPositions));
     },
 
     _portfolioPositions = await _getPortfolioPositions(),
@@ -150,7 +163,7 @@ async function currencySells(from, to) {
 
         quantity = R.sum(operations.map(R.prop('quantity'))),
         payment = R.sum(operations.map(R.prop('payment'))),
-        commission = calculateTotalCommission(operations),
+        commission = -calculateTotalCommissionInRub(operations),
         averagePrice = average(operations.map(R.prop('price')));
 
     return {
@@ -173,62 +186,64 @@ async function dividends(year) {
         .map(addTickerAndName)
 }
 
-function calculateTotalCommission(objectsWithCommission, currency) {
+function calculateTotalCommissionInRub(objectsWithCommission, currency) {
     let result = R.sum(objectsWithCommission.map(R.pipe(R.path(['commission', 'value']), R.defaultTo(0))));
     if (currency === 'USD') {
         result *= getRate('USD');
     }
-    return -result;
+    return result;
 }
 
 // noinspection JSUnusedGlobalSymbols
-async function purchasesByInstrument(from, to) {
+async function purchasesByInstrument(from, to, {renderer} = {}) {
     const purchasesList = (await purchases(from, to))
             .filter(it => it.operationType === 'Buy'),
 
-        groupByInstrument = R.groupBy(it => `${it.instrumentType} ${it.currency}`),
+        stocksFirstComparator = R.descend(R.prop('instrumentType')),
+        rubFirstComparator = R.ascend(R.prop('currency')),
+        byTickerComparator = R.ascend(R.prop('ticker')),
+        sort = R.sortWith([stocksFirstComparator, rubFirstComparator, byTickerComparator]),
 
-        calculateTotals = operations => {
-            const currency = operations[0].currency,
-                payment = -R.sum(operations.map(R.prop('payment'))),
-                commission = calculateTotalCommission(operations, currency);
+        makeAllValuesPositive = purchases => purchases.map(it => ({...it, payment: -it.payment})),  //make generic
+
+        groupByInstrument = purchases => {
+            const group = R.groupBy(it => `${it.instrumentType} ${it.currency}`);
+            return R.pipe(group, Object.entries)(purchases)
+                .map(([ticker, purchases]) => ({ticker, purchases}));
+        },
+
+        mergeSamePurchases = groups => groups
+            .map(it => ({...it, purchases: mergeSamePositions(it.purchases)})),
+
+        calculateTotals = purchases => {
+            const currency = purchases[0].currency,
+                payment = R.sum(purchases.map(R.prop('payment'))),
+                commission = -calculateTotalCommissionInRub(purchases, currency);
 
             return {
                 currency,
-                instrumentType: operations[0].instrumentType,
+                instrumentType: purchases[0].instrumentType,
                 payment: payment,
                 commission: commission
             }
         },
 
-        withTotals = groups => {
-            const result = mapValuesIn(groups, operations => ({
-                ...calculateTotals(operations),
-                operations: operations
+        withTotals = groups => groups.map(it => ({
+            ticker: it.ticker,
+            ...calculateTotals(it.purchases),
+            ...it
+        })),
+
+        prettifyValues = groups => groups
+            .map(it => prettifyMoneyValues({
+                ...it,
+                payment: renderer?.('payment', it) ?? formatMoney(it.payment, it.currency),
+                commission: formatMoney(it.commission, 'RUB'),
+                purchases: it.purchases.map(prettifyMoneyValues)
             }));
 
-            result.commission = R.sum(Object.values(result).map(R.prop('commission')));
-
-            return result;
-        },
-
-        prettifyValues = groups => {
-            return mapValuesIn(groups, value => {
-                if (typeof value === 'object') {
-                    return {
-                        ...value,
-                        payment: formatMoney(value.payment, value.currency),
-                        commission: formatMoney(value.commission, 'RUB'),
-                        operations: value.operations.map(prettifyMoneyValues)
-                    }
-                } else {
-                    return formatMoney(value, 'RUB');
-                }
-            });
-        }
-
     await preloadRate('USD', 'RUB');
-    return R.pipe(groupByInstrument, withTotals, prettifyValues)(purchasesList);
+    return R.pipe(sort, makeAllValuesPositive, groupByInstrument, mergeSamePurchases, withTotals, prettifyValues)(purchasesList);
 }
 
 function convertToCurrency(toCurrency, moneyObj) {
@@ -250,22 +265,19 @@ async function positions({inCurrency, predicate = R.T} = {}) {
     }
 
     const positions = (await _getPortfolioPositions())
-            .filter(predicate)
-            .map(it =>
-                withExpectedYieldPercent({
-                    ...it,
-                    averagePositionPrice: convertToCurrency(inCurrency, it.averagePositionPrice),
-                    totalPrice: convertToCurrency(inCurrency, {
-                        currency: it.averagePositionPrice.currency,
-                        value: it.averagePositionPrice.value * it.balance
-                    }),
-                    expectedYield: convertToCurrency(inCurrency, it.expectedYield)
-                })),
+        .filter(predicate)
+        .map(it =>
+            withExpectedYieldPercent({
+                ...it,
+                averagePositionPrice: convertToCurrency(inCurrency, it.averagePositionPrice),
+                totalPrice: convertToCurrency(inCurrency, {
+                    currency: it.averagePositionPrice.currency,
+                    value: it.averagePositionPrice.value * it.balance
+                }),
+                expectedYield: convertToCurrency(inCurrency, it.expectedYield)
+            }));
 
-        groupByFigi = R.pipe(R.groupBy(R.prop('figi')), Object.values);
-
-    return groupByFigi(positions)
-        .map(mergePositions);
+    return mergeSamePositions(positions);
 }
 
 // noinspection JSUnusedGlobalSymbols
@@ -284,7 +296,7 @@ async function falls(positionParams) {
 }
 
 // noinspection JSUnusedGlobalSymbols
-async function consolidateBy(compositionFn, positionParams) {
+async function consolidatePositionsBy(compositionFn, positionParams) {
     const consolidatingReducer = (acc, it) => {
             const compositionTicker = compositionFn(it);
             if (!!compositionTicker) {
@@ -310,13 +322,20 @@ async function consolidateBy(compositionFn, positionParams) {
                 return it;
             }
 
-            const {totalPrice, expectedYield} = mergePositions(it.positions);
+            const {totalPrice, expectedYield} = it.positions.reduce(mergeTwoPositions);
             return withExpectedYieldPercent({
                 ...it,
                 totalPrice,
                 expectedYield
             });
         }
+
+    if (!positionParams?.predicate) {
+        positionParams = {
+            ...positionParams,
+            predicate: it => it.instrumentType !== 'Currency'
+        };
+    }
 
     //todo: order both positions and compositions by total price desc
     return (await positions(positionParams))
@@ -325,11 +344,11 @@ async function consolidateBy(compositionFn, positionParams) {
 }
 
 // noinspection JSUnusedGlobalSymbols
-async function consolidate(compositions, positionParams) {
+async function consolidatePositions(compositions, positionParams) {
     const findCompositionWithTicker = ticker => R.find(R.pipe(R.prop('tickers'), R.includes(ticker))),
         findOutCompositionName = pos => R.pipe(findCompositionWithTicker(pos.ticker), R.prop('name'))(compositions);
 
-    return (await consolidateBy(findOutCompositionName, positionParams));
+    return (await consolidatePositionsBy(findOutCompositionName, positionParams));
 }
 
 export {
@@ -338,10 +357,11 @@ export {
     currencySells,
     stocks,
     falls,
-    consolidate,
-    consolidateBy,
+    consolidatePositions,
+    consolidatePositionsBy,
     prettifyMoneyValues,
     formatMoney,
+    formatMoneyObject,
     purchasesByInstrument,
     dividends
 };

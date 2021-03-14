@@ -12,9 +12,11 @@
   "license": "ISC",
   "dependencies": {
     "@tinkoff/invest-openapi-js-sdk": "^1.2.16",
+    "bars": "github:jstrace/bars",
+    "chalk": "^4.1.0",
     "dotenv": "^8.2.0",
     "exchange-rates-api": "^1.0.2",
-    "micex.api": "^0.2.2",
+    "figures": "^3.2.0",
     "ramda": "^0.27.1"
   },
   "devDependencies": {
