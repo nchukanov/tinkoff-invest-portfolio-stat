@@ -8,12 +8,26 @@ import bar from 'bars';
     try {
         // noinspection JSUnusedLocalSymbols,JSMismatchedCollectionQueryUpdate
         const periods = {
-            'Feb': [new Date(2021, 0, 28), new Date(2021, 1, 24)],
-            'Mar': [new Date(2021, 1, 25), new Date()]
-        };
+                'Jan': [new Date(2021, 0, 1), new Date(2021, 0, 27)],
+                'Feb': [new Date(2021, 0, 28), new Date(2021, 1, 24)],
+                'Mar': [new Date(2021, 1, 25), new Date()],
+                currentYear: [new Date(2020, 11, 20), new Date()],
+            },
+            title = str => {
+                console.log();
+                console.log(chalk.bgBlue.whiteBright.bold(str));
+                console.log();
+            },
+            heading = str => {
+                console.log(chalk.blue.bold(str));
+            },
+            subheading = str => {
+                console.log(chalk.whiteBright(str));
+            };
 
-        // console.log(await stat.currencySells(periods.Feb[0], periods.Feb[1]));
-        // console.log(await stat.currencySells(periods.Mar[0], periods.Mar[1]));
+        /*title('Currency Sells');
+        console.log(await stat.currencySells(periods.Feb[0], periods.Feb[1]));
+        console.log(await stat.currencySells(periods.Mar[0], periods.Mar[1]));*/
 
         //decline vs rise
         /*const falls = await stat.falls(),
@@ -47,34 +61,32 @@ import bar from 'bars';
         //RUB vs USD
         /*console.dir((await stat.consolidatePositionsBy(
                 it => it.totalPrice.originalCurrency || it.totalPrice.currency,
-                {inCurrency: 'RUB')
-        ).map(stat.prettifyMoneyValues), {depth: 2});*/
+                {inCurrency: 'RUB'}
+        )).map(stat.prettifyMoneyValues), {depth: 2});*/
 
-        const title = chalk.bgBlue.bold,
-            heading = chalk.blue.bold;
+        //Portfolio and purchases by instrument type and currency
+        const purchaseLimits = {
+                'Stock RUB': Number(process.env.LIMIT_STOCK_RUB),
+                'Stock USD': Number(process.env.LIMIT_STOCK_USD),
+                'Etf RUB': Number(process.env.LIMIT_ETF_RUB),
+                'Etf USD': Number(process.env.LIMIT_ETF_USD)
+            },
 
-        console.log(title('Portfolio by instrument type and currency'));
-        console.log();
-        (await stat.consolidatePositionsBy(it => `${it.instrumentType} ${it.totalPrice.currency}`))
-            .forEach(group => {
+            outputPositionsGroup = group => {
                 const positions = R.sort(R.ascend(R.path(['expectedYield', 'percent'])))(group.positions)
                     .filter(pos => !['FXRL', 'FXRW', 'FXRB'].includes(pos.ticker));
-                console.log(heading(`${group.ticker} - ${stat.formatMoneyObject(group.totalPrice).value}`));
 
                 const tableData = positions
                     .map(pos => {
-                        const {value, percent} = stat.formatMoneyObject({
-                            ...pos.totalPrice,
-                            percent: pos.totalPrice.value * 100 / group.totalPrice.value
-                        });
                         return {
                             ticker: pos.ticker,
                             name: pos.name,
-                            value,
-                            'share percent': percent,
-                            [`yield percent ${figures.arrowDown}`]: stat.formatMoneyObject(pos.expectedYield).percent
+                            value: stat.formatMoneyObject(pos.totalPrice).value,
+                            [`yield percent ${figures.arrowDown}`]: stat.formatMoneyObject(pos.expectedYield).percent,
+                            'percent of presence': stat.formatPercent(pos.percent)
                         }
                     });
+                subheading('Portfolio positions');
                 console.table(tableData);
 
                 const barData = positions
@@ -86,36 +98,52 @@ import bar from 'bars';
                     sort: true,
                     map: value => {
                         let pos = positions.filter(R.pathEq(['totalPrice', 'value'], value))[0];
-                        return `${stat.formatMoneyObject(pos.totalPrice).value} | ${stat.formatMoneyObject(pos.expectedYield).percent}`
+                        return `${stat.formatMoneyObject(pos.totalPrice).value} | ${stat.formatPercent(pos.percent)}`
                     }
                 })));
-            });
-
-        // console.log(((await stat.purchases(periods.Mar[0], periods.Mar[1])).map(stat.prettifyMoneyValues)));
-
-        console.log(title('Purchases by instrument type and currency'));
-        console.log();
-        const limits = {
-                'Stock RUB': Number(process.env.LIMIT_STOCK_RUB),
-                'Stock USD': Number(process.env.LIMIT_STOCK_USD),
-                'Etf RUB': Number(process.env.LIMIT_ETF_RUB),
-                'Etf USD': Number(process.env.LIMIT_ETF_USD)
             },
-            renderer = (key, {ticker, payment, currency}) => {
-                if (key === 'payment' && payment > limits[ticker]) {
-                    const format = value => stat.formatMoney(value, currency);
-                    return `${chalk.red(format(payment))} out of ${format(limits[ticker])}`
-                } else {
-                    return undefined;
-                }
-            };
 
-        (await stat.purchasesByInstrument(periods.Mar[0], periods.Mar[1], {renderer}))
-            .forEach(({ticker, payment, purchases}) => {
-                console.log(heading(`${ticker} [${payment}]`));
+            outputPurchasesGroup = ({purchases}) => {
+                subheading('Purchases within the period');
                 console.table(purchases
-                    .map(({ticker, name, price, quantity, payment}) => ({ticker, name, price, quantity, payment})));
-            });
+                    .map(stat.prettifyMoneyValues)
+                    .map(({ticker, name, price, quantity, payment}) => ({
+                        [`ticker ${figures.arrowDown}`]: ticker,
+                        name,
+                        price,
+                        quantity,
+                        payment
+                    })));
+            },
+
+            positions = await stat.consolidatePositionsBy(it => `${it.instrumentType} ${it.totalPrice.currency}`),
+            purchases = await stat.purchasesByInstrument(periods.Mar[0], periods.Mar[1]);
+
+        title('Portfolio and purchases by instrument type and currency');
+        R.zip(positions, purchases).forEach(zip => {
+            const {ticker, currency, totalPrice: totalPositionPrice} = zip[0],
+                {payment: purchasePayment} = zip[1],
+
+                format = value => stat.formatMoney(value, currency),
+                purchasesLimit = purchaseLimits[ticker],
+                formattedPurchasePayment = R.pipe(format, purchasePayment > purchasesLimit ? chalk.red : R.identity)(purchasePayment),
+                formattedPurchaseLimit = purchasesLimit ? ` out of ${format(purchasesLimit)}` : '';
+
+            heading(`${ticker}: 
+                Portfolio ${stat.formatMoneyObject(totalPositionPrice).value}
+                Purchases [${formattedPurchasePayment}${formattedPurchaseLimit}]`);
+
+            outputPositionsGroup(zip[0]);
+            outputPurchasesGroup(zip[1]);
+            console.log();
+        })
+
+        const paymentToRub = ({currency, payment}) => currency === 'USD' ? stat.getRate('USD') * payment : payment,
+            totalPurchasesAmount = R.reduce(R.add, 0, purchases.map(paymentToRub)),
+            totalCommission = R.reduce(R.add, 0, purchases.map(R.prop('commission')));
+        heading('Purchase totals:')
+        console.log(`Purchases amount - ${stat.formatMoney(totalPurchasesAmount, 'RUB')}`);
+        console.log(`Commission - ${stat.formatMoney(totalCommission, 'RUB')}`);
 
     } catch (err) {
         console.error(err);

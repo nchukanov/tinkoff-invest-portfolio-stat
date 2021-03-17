@@ -72,7 +72,10 @@ const accounts = (await api.accounts()).accounts,
             name,
             ...operation
         }
-    };
+    },
+
+    stocksFirstComparator = R.descend(R.prop('instrumentType')),
+    rubFirstComparator = R.ascend(R.prop('currency'));
 
 function setPrimaryAccount() {
     api.setCurrentAccountId(accounts[0].brokerAccountId);
@@ -103,10 +106,14 @@ function formatMoneyObject(obj) {
         };
 
     if (!!percent) {
-        result.percent = `${percent.toFixed(2)} %`
+        result.percent = formatPercent(percent);
     }
 
     return result;
+}
+
+function formatPercent(value) {
+    return `${value.toFixed(2)} %`;
 }
 
 function isMoneyObject(obj) {
@@ -195,12 +202,10 @@ function calculateTotalCommissionInRub(objectsWithCommission, currency) {
 }
 
 // noinspection JSUnusedGlobalSymbols
-async function purchasesByInstrument(from, to, {renderer} = {}) {
+async function purchasesByInstrument(from, to) {
     const purchasesList = (await purchases(from, to))
             .filter(it => it.operationType === 'Buy'),
 
-        stocksFirstComparator = R.descend(R.prop('instrumentType')),
-        rubFirstComparator = R.ascend(R.prop('currency')),
         byTickerComparator = R.ascend(R.prop('ticker')),
         sort = R.sortWith([stocksFirstComparator, rubFirstComparator, byTickerComparator]),
 
@@ -232,18 +237,10 @@ async function purchasesByInstrument(from, to, {renderer} = {}) {
             ticker: it.ticker,
             ...calculateTotals(it.purchases),
             ...it
-        })),
-
-        prettifyValues = groups => groups
-            .map(it => prettifyMoneyValues({
-                ...it,
-                payment: renderer?.('payment', it) ?? formatMoney(it.payment, it.currency),
-                commission: formatMoney(it.commission, 'RUB'),
-                purchases: it.purchases.map(prettifyMoneyValues)
-            }));
+        }));
 
     await preloadRate('USD', 'RUB');
-    return R.pipe(sort, makeAllValuesPositive, groupByInstrument, mergeSamePurchases, withTotals, prettifyValues)(purchasesList);
+    return R.pipe(sort, makeAllValuesPositive, groupByInstrument, mergeSamePurchases, withTotals)(purchasesList);
 }
 
 function convertToCurrency(toCurrency, moneyObj) {
@@ -297,7 +294,8 @@ async function falls(positionParams) {
 
 // noinspection JSUnusedGlobalSymbols
 async function consolidatePositionsBy(compositionFn, positionParams) {
-    const consolidatingReducer = (acc, it) => {
+    const
+        consolidatingReducer = (acc, it) => {
             const compositionTicker = compositionFn(it);
             if (!!compositionTicker) {
                 const consolidatedPosition = R.find(R.propEq('ticker', compositionTicker))(acc);
@@ -306,6 +304,8 @@ async function consolidatePositionsBy(compositionFn, positionParams) {
                 } else {
                     acc = [...acc, {
                         ticker: compositionTicker,
+                        instrumentType: it.instrumentType,
+                        currency: it.totalPrice.currency,
                         consolidated: true,
                         positions: [it]
                     }]
@@ -317,18 +317,35 @@ async function consolidatePositionsBy(compositionFn, positionParams) {
             return acc;
         },
 
-        calculateConsolidatedTotals = it => {
-            if (!it.consolidated) {
-                return it;
+        calculateConsolidatedTotals = group => {
+            if (!group.consolidated) {
+                return group;
             }
 
-            const {totalPrice, expectedYield} = it.positions.reduce(mergeTwoPositions);
+            const {totalPrice, expectedYield} = group.positions.reduce(mergeTwoPositions);
             return withExpectedYieldPercent({
-                ...it,
+                ...group,
                 totalPrice,
                 expectedYield
             });
-        }
+        },
+
+        calculatePercentOfPresence = group => {
+            if (!group.consolidated) {
+                return group;
+            }
+
+            const newPositions = group.positions
+                .map(it => ({...it, percent: it.totalPrice.value * 100 / group.totalPrice.value}))
+
+            return {
+                ...group,
+                positions: newPositions
+            };
+        },
+
+        sort = R.sortWith([stocksFirstComparator, rubFirstComparator]);
+
 
     if (!positionParams?.predicate) {
         positionParams = {
@@ -337,10 +354,12 @@ async function consolidatePositionsBy(compositionFn, positionParams) {
         };
     }
 
-    //todo: order both positions and compositions by total price desc
-    return (await positions(positionParams))
+    const result = (await positions(positionParams))
         .reduce(consolidatingReducer, [])
-        .map(calculateConsolidatedTotals);
+        .map(calculateConsolidatedTotals)
+        .map(calculatePercentOfPresence);
+
+    return sort(result);
 }
 
 // noinspection JSUnusedGlobalSymbols
@@ -352,6 +371,7 @@ async function consolidatePositions(compositions, positionParams) {
 }
 
 export {
+    getRate,
     purchases,
     positions,
     currencySells,
@@ -362,6 +382,7 @@ export {
     prettifyMoneyValues,
     formatMoney,
     formatMoneyObject,
+    formatPercent,
     purchasesByInstrument,
     dividends
 };
