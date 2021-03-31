@@ -98,7 +98,7 @@ function formatMoney(value, symbol) {
     });
 }
 
-function formatMoneyObject(obj) {
+const formatMoneyObject = R.curry(obj => {
     const {value, currency, percent} = obj,
         result = {
             ...obj,
@@ -110,7 +110,7 @@ function formatMoneyObject(obj) {
     }
 
     return result;
-}
+});
 
 function formatPercent(value) {
     return `${value.toFixed(2)} %`;
@@ -243,7 +243,7 @@ async function purchasesByInstrument(from, to) {
     return R.pipe(sort, makeAllValuesPositive, groupByInstrument, mergeSamePurchases, withTotals)(purchasesList);
 }
 
-function convertToCurrency(toCurrency, moneyObj) {
+const convertToCurrency = R.curry((toCurrency, moneyObj) => {
     if (moneyObj.currency === 'USD' && toCurrency === 'RUB') {
         return {
             ...moneyObj,
@@ -254,7 +254,7 @@ function convertToCurrency(toCurrency, moneyObj) {
     } else {
         return moneyObj;
     }
-}
+});
 
 async function positions({inCurrency, predicate = R.T} = {}) {
     if (inCurrency === 'RUB') {
@@ -372,6 +372,7 @@ async function consolidatePositions(compositions, positionParams) {
 
 export {
     getRate,
+    convertToCurrency,
     purchases,
     positions,
     currencySells,
