@@ -15,7 +15,7 @@
     "bars": "github:jstrace/bars",
     "chalk": "^4.1.0",
     "dotenv": "^8.2.0",
-    "exchange-rates-api": "^1.0.2",
+    "exchangerate-api": "^0.1.0",
     "figures": "^3.2.0",
     "ramda": "^0.27.1"
   },

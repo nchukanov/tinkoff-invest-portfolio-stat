@@ -1,7 +1,7 @@
 import * as dotenv from 'dotenv'
 import * as R from 'ramda';
 import OpenAPI from '@tinkoff/invest-openapi-js-sdk';
-import {exchangeRates} from 'exchange-rates-api';
+import exchangeRateClient from 'exchangerate-api';
 
 dotenv.config();
 
@@ -12,7 +12,7 @@ const api = new OpenAPI({
 });
 
 const accounts = (await api.accounts()).accounts,
-    usdRates = {},
+    usdRate = await exchangeRateClient.ratesFor('USD'),
     average = R.converge(R.divide, [R.sum, R.length]),
     withExpectedYieldPercent = pos => {
         if (pos.expectedYield && pos.totalPrice) {
@@ -81,14 +81,8 @@ function setPrimaryAccount() {
     api.setCurrentAccountId(accounts[0].brokerAccountId);
 }
 
-async function preloadRate(from, to) {
-    if (!usdRates[from]) {
-        usdRates[from] = await exchangeRates().base(from).symbols(to).fetch();
-    }
-}
-
-function getRate(currency) {
-    return usdRates[currency] || 1;
+function getUsdRate(currency) {
+    return usdRate.getRate(currency);
 }
 
 function formatMoney(value, symbol) {
@@ -196,7 +190,7 @@ async function dividends(year) {
 function calculateTotalCommissionInRub(objectsWithCommission, currency) {
     let result = R.sum(objectsWithCommission.map(R.pipe(R.path(['commission', 'value']), R.defaultTo(0))));
     if (currency === 'USD') {
-        result *= getRate('USD');
+        result *= getUsdRate('RUB');
     }
     return result;
 }
@@ -239,17 +233,18 @@ async function purchasesByInstrument(from, to) {
             ...it
         }));
 
-    await preloadRate('USD', 'RUB');
     return R.pipe(sort, makeAllValuesPositive, groupByInstrument, mergeSamePurchases, withTotals)(purchasesList);
 }
 
 const convertToCurrency = R.curry((toCurrency, moneyObj) => {
     if (moneyObj.currency === 'USD' && toCurrency === 'RUB') {
+        const valueField = !!moneyObj.value ? 'value' :
+            !!moneyObj.payment ? 'payment' : undefined;
         return {
             ...moneyObj,
             originalCurrency: moneyObj.currency,
             currency: toCurrency,
-            value: getRate('USD') * moneyObj.value
+            ...(moneyObj[valueField] && {[valueField]: getUsdRate('RUB') * moneyObj[valueField]})
         }
     } else {
         return moneyObj;
@@ -257,10 +252,6 @@ const convertToCurrency = R.curry((toCurrency, moneyObj) => {
 });
 
 async function positions({inCurrency, predicate = R.T} = {}) {
-    if (inCurrency === 'RUB') {
-        await preloadRate('USD', 'RUB');
-    }
-
     const positions = (await _getPortfolioPositions())
         .filter(predicate)
         .map(it =>
@@ -285,7 +276,7 @@ async function stocks(positionParams) {
 }
 
 // noinspection JSUnusedGlobalSymbols
-async function falls(positionParams) {
+async function drawdowns(positionParams) {
     const expectedYieldPercent = R.path(['expectedYield', 'percent']);
     return (await positions(positionParams))
         .filter(it => expectedYieldPercent(it) < 0 && it.instrumentType !== 'Currency')
@@ -371,13 +362,12 @@ async function consolidatePositions(compositions, positionParams) {
 }
 
 export {
-    getRate,
     convertToCurrency,
     purchases,
     positions,
     currencySells,
     stocks,
-    falls,
+    drawdowns,
     consolidatePositions,
     consolidatePositionsBy,
     prettifyMoneyValues,
